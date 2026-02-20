@@ -1,0 +1,21 @@
+# Env and secrets — keep .env out of version control
+.env
+.env.local
+*.pem
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+venv/
+.venv/
+
+# IDE / OS
+.idea/
+.DS_Store
+*.swp
+*.swo
+
+# Extracted blueprint (optional; uncomment if you don't want it in repo)
+# AgentWatch_Blueprint.txt
