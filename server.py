@@ -715,39 +715,105 @@ async function sendCompare() {
   input.value = '';
 
   addMsg('user', 'You (Compare Mode)', escHtml(msg));
-  addMsg('narration', 'Compare', 'Sending same message with and without Agent Watch protection...');
+  addMsg('narration', 'Compare', 'Sending the same message through two paths: one with no protection, one with Agent Watch. Watch the difference.');
 
   const container = document.getElementById('compare-container');
   container.classList.add('active');
   document.getElementById('compare-before').innerHTML = '<span class="spinner"></span> Running without protection...';
-  document.getElementById('compare-after').innerHTML = '<span class="spinner"></span> Running with protection...';
+  document.getElementById('compare-after').innerHTML = '<span class="spinner"></span> Running with Agent Watch...';
 
   const [unprotected, protected_] = await Promise.all([
     fetch('/api/unprotected', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:msg})}).then(r=>r.json()),
     fetch('/api/monitor', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:msg,agent:'support-agent'})}).then(r=>r.json()),
   ]);
 
-  // Before column
-  let beforeHtml = '<div style="margin-bottom:6px"><strong>Status:</strong> <span style="color:var(--red)">'+unprotected.status+'</span></div>';
-  beforeHtml += '<div style="font-size:12px;margin-bottom:6px">'+escHtml(unprotected.agent_response||'')+'</div>';
+  // ── Before column (unprotected) ──
+  let beforeHtml = '<div style="margin-bottom:8px"><strong>Status:</strong> <span style="color:var(--yellow)">'+unprotected.status+'</span></div>';
+  beforeHtml += '<div style="font-size:12px;margin-bottom:8px;line-height:1.5">'+escHtml(unprotected.agent_response||'')+'</div>';
+
+  // Show tools executed without checks
   if (unprotected.tool_calls && unprotected.tool_calls.length > 0) {
-    beforeHtml += '<div style="font-size:11px;color:var(--red)"><strong>Tools executed without checks:</strong><br>'
-      + unprotected.tool_calls.map(tc => '&#x26a0; '+tc.name+' — '+JSON.stringify(tc.params).substring(0,50)).join('<br>') + '</div>';
+    beforeHtml += '<div style="margin-bottom:8px;padding:8px;background:rgba(210,153,34,0.1);border-radius:6px;font-size:11px">'
+      + '<strong style="color:var(--yellow)">Tools executed with NO checks:</strong><br>'
+      + unprotected.tool_calls.map(tc => '<div style="margin-top:4px">&#x26a0; <strong>'+tc.name+'</strong> '+escHtml(JSON.stringify(tc.params||{}).substring(0,60))+'</div>').join('')
+      + '</div>';
+  } else {
+    beforeHtml += '<div style="font-size:11px;color:var(--text-muted);margin-bottom:8px">No tool calls made by model</div>';
   }
+
+  // Show what's MISSING
+  beforeHtml += '<div style="padding:8px;background:rgba(248,81,73,0.08);border:1px solid rgba(248,81,73,0.2);border-radius:6px;font-size:11px">'
+    + '<strong style="color:var(--red)">Missing Protections:</strong>';
+  (unprotected.missing_protections || []).forEach(p => {
+    beforeHtml += '<div style="margin-top:3px;color:var(--red)">&#x274c; '+escHtml(p)+'</div>';
+  });
+  beforeHtml += '</div>';
+
+  // Show what would have been caught
+  if (unprotected.missed_threats && unprotected.missed_threats.length > 0) {
+    beforeHtml += '<div style="margin-top:8px;padding:8px;background:rgba(248,81,73,0.12);border:1px solid rgba(248,81,73,0.3);border-radius:6px;font-size:11px">'
+      + '<strong style="color:var(--red)">Threats Missed:</strong>';
+    unprotected.missed_threats.forEach(t => {
+      beforeHtml += '<div style="margin-top:3px;color:var(--red)">&#x1f6a8; '+escHtml(t)+'</div>';
+    });
+    beforeHtml += '</div>';
+  }
+
+  beforeHtml += '<div style="margin-top:8px;font-size:10px;color:var(--text-muted)">Latency: '+(unprotected.latency||0).toFixed(2)+'s | Tokens: '+(unprotected.tokens?.input||0)+'+'+(unprotected.tokens?.output||0)+'</div>';
+
   document.getElementById('compare-before').innerHTML = beforeHtml;
 
-  // After column
-  let afterHtml = '<div style="margin-bottom:6px"><strong>Status:</strong> <span style="color:'+(protected_.status==='OK'?'var(--green)':'var(--red)')+'">'+protected_.status+'</span></div>';
-  afterHtml += '<div style="font-size:12px;margin-bottom:6px">'+escHtml(protected_.agent_response||'')+'</div>';
+  // ── After column (protected) ──
+  const pColor = protected_.status==='OK'?'var(--green)':'var(--red)';
+  let afterHtml = '<div style="margin-bottom:8px"><strong>Status:</strong> <span style="color:'+pColor+'">'+protected_.status+'</span></div>';
+  afterHtml += '<div style="font-size:12px;margin-bottom:8px;line-height:1.5">'+escHtml(protected_.agent_response||'')+'</div>';
+
   if (protected_.reason) {
-    afterHtml += '<div style="font-size:11px;color:var(--green)"><strong>'+escHtml(protected_.reason)+'</strong></div>';
+    afterHtml += '<div style="margin-bottom:8px;font-size:12px;color:'+pColor+';font-weight:600">'+escHtml(protected_.reason)+'</div>';
   }
-  if (protected_.monitoring && protected_.monitoring.security_checks) {
-    afterHtml += protected_.monitoring.security_checks.map(sc => {
-      return '<div style="font-size:11px;color:'+(sc.allowed?'var(--green)':'var(--red)')+'">'
-        +(sc.allowed?'&#x2705;':'&#x1f6d1;')+' '+sc.tool+': '+(sc.allowed?'Allowed':'Blocked')+'</div>';
-    }).join('');
+
+  // Show security checks
+  if (protected_.monitoring && protected_.monitoring.security_checks && protected_.monitoring.security_checks.length > 0) {
+    afterHtml += '<div style="margin-bottom:8px;padding:8px;background:rgba(63,185,80,0.08);border-radius:6px;font-size:11px">'
+      + '<strong style="color:var(--green)">Security Checks (Neo4j):</strong>';
+    protected_.monitoring.security_checks.forEach(sc => {
+      const c = sc.allowed ? 'var(--green)' : 'var(--red)';
+      const icon = sc.allowed ? '&#x2705;' : '&#x1f6d1;';
+      afterHtml += '<div style="margin-top:3px;color:'+c+'">'+icon+' <strong>'+sc.tool+'</strong>: '+(sc.allowed?'Allowed':'Blocked')+' <span style="color:var(--text-muted)">('+escHtml(sc.source||'')+')</span></div>';
+      if (sc.reason && !sc.allowed) afterHtml += '<div style="margin-left:20px;color:var(--text-muted);font-size:10px">'+escHtml(sc.reason)+'</div>';
+    });
+    afterHtml += '</div>';
   }
+
+  // Show behavior evaluation
+  if (protected_.behavior) {
+    const bOk = protected_.behavior.compliant;
+    afterHtml += '<div style="margin-bottom:8px;padding:8px;background:rgba('+(bOk?'63,185,80':'248,81,73')+',0.08);border-radius:6px;font-size:11px">'
+      + '<strong style="color:'+(bOk?'var(--green)':'var(--red)')+'">Behavior Evaluation:</strong>'
+      + '<div style="margin-top:3px;color:'+(bOk?'var(--green)':'var(--red)')+'">'+(bOk?'&#x2705; Compliant':'&#x1f6a8; Drift detected')+'</div>';
+    if (protected_.behavior.issues && protected_.behavior.issues.length > 0) {
+      protected_.behavior.issues.forEach(i => {
+        afterHtml += '<div style="margin-top:2px;margin-left:20px;color:var(--text-muted);font-size:10px">'+escHtml(i)+'</div>';
+      });
+    }
+    if (protected_.behavior.detected_by) {
+      afterHtml += '<div style="margin-top:3px;color:var(--text-muted);font-size:10px">Detected by: '+escHtml(protected_.behavior.detected_by)+'</div>';
+    }
+    afterHtml += '</div>';
+  }
+
+  // Show active protections
+  afterHtml += '<div style="padding:8px;background:rgba(63,185,80,0.08);border:1px solid rgba(63,185,80,0.2);border-radius:6px;font-size:11px">'
+    + '<strong style="color:var(--green)">Active Protections:</strong>'
+    + '<div style="margin-top:3px;color:var(--green)">&#x2705; Input threat screening</div>'
+    + '<div style="margin-top:3px;color:var(--green)">&#x2705; Behavior evaluation (LLM auditor)</div>'
+    + '<div style="margin-top:3px;color:var(--green)">&#x2705; Neo4j policy graph checks</div>'
+    + '<div style="margin-top:3px;color:var(--green)">&#x2705; Cost tracking &amp; throttling</div>'
+    + '<div style="margin-top:3px;color:var(--green)">&#x2705; Datadog metrics &amp; audit trail</div>'
+    + '</div>';
+
+  afterHtml += '<div style="margin-top:8px;font-size:10px;color:var(--text-muted)">Latency: '+(protected_.latency||0).toFixed(2)+'s</div>';
+
   document.getElementById('compare-after').innerHTML = afterHtml;
 
   handleResult(protected_);

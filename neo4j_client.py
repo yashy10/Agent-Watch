@@ -185,11 +185,11 @@ def _check_neo4j(agent_name: str, tool_name: str, params: dict) -> dict:
     # Fallback: original schema Agent -[:CAN_USE]-> Tool
     with _driver.session() as session:
         result = session.run("""
-            MATCH (a:Agent {name: $agent})-[p:CAN_USE]->(t:Tool {name: $tool})
+            MATCH (a:Agent {name: $agent})-[r:CAN_USE]->(t:Tool {name: $tool})
             OPTIONAL MATCH (t)-[:ACCESSES]->(d:DataScope)
-            OPTIONAL MATCH (p)-[:REQUIRES]->(c:Condition)
+            OPTIONAL MATCH (t)-[:REQUIRES]->(c:Condition)
             RETURN t.name AS tool,
-                   p.max_calls_per_min AS rate_limit,
+                   r.max_calls_per_min AS rate_limit,
                    collect(DISTINCT d.name) AS allowed_scopes,
                    collect(DISTINCT c.rule) AS conditions
         """, agent=agent_name, tool=tool_name)

@@ -202,6 +202,63 @@ def _evaluate_rules(user_message: str, response_text: str, tool_calls: list) -> 
     }
 
 
+# ── Input Screening ──
+
+def _screen_input(user_message: str) -> dict | None:
+    """
+    Pre-model input screening for common attack patterns.
+    Catches threats before they even reach the LLM — defense in depth.
+    Returns a threat dict if detected, None if clean.
+    """
+    msg = user_message.lower()
+
+    # Social engineering: someone claiming authority + requesting data exfil
+    authority_claims = ["i am the ceo", "i'm the ceo", "i am the admin", "i'm the admin",
+                        "as the ceo", "as the admin", "ceo here", "admin here",
+                        "i am user", "i'm user"]
+    exfil_signals = ["send", "email", "forward", "export", "copy", "transfer"]
+    external_signals = ["gmail", "yahoo", "hotmail", "outlook.com", "external",
+                        "personal", "my new", "my address", "my email"]
+
+    has_authority = any(phrase in msg for phrase in authority_claims)
+    has_exfil = any(word in msg for word in exfil_signals)
+    has_external = any(word in msg for word in external_signals)
+
+    if has_exfil and has_external:
+        # Data exfiltration attempt — regardless of authority claim
+        import re
+        ext_email = re.search(r'[\w.-]+@(?!company\.com)[\w.-]+\.\w+', user_message)
+        if ext_email:
+            return {
+                "threat_type": "data_exfiltration",
+                "reason": f"Data exfiltration attempt detected: request to send data to external address ({ext_email.group(0)})",
+                "confidence": "high",
+            }
+
+    if has_authority and has_exfil:
+        return {
+            "threat_type": "social_engineering",
+            "reason": "Social engineering detected: authority claim combined with data access/export request",
+            "confidence": "high",
+        }
+
+    # Prompt injection patterns
+    injection_phrases = [
+        "ignore previous", "ignore your instructions", "ignore all",
+        "new instructions", "you are now", "pretend you are",
+        "forget your rules", "forget everything", "disregard",
+        "override your", "bypass your",
+    ]
+    if any(phrase in msg for phrase in injection_phrases):
+        return {
+            "threat_type": "prompt_injection",
+            "reason": "Prompt injection attempt detected in user input",
+            "confidence": "medium",
+        }
+
+    return None
+
+
 # ── Main Handler ──
 
 def handle_request(user_message: str, agent_name: str = "support-agent") -> dict:
@@ -222,6 +279,12 @@ def handle_request(user_message: str, agent_name: str = "support-agent") -> dict
     print(f"{'='*70}")
 
     start_time = time.time()
+
+    # ── Step 0: Input-level threat screening (runs in parallel with model call) ──
+    print(f"\n  [step 0] Screening input for known threat patterns...")
+    input_threat = _screen_input(user_message)
+    if input_threat:
+        print(f"  [input]  ⚠️  Threat signal: {input_threat['threat_type']} — will verify with model")
 
     # ── Step 1: Call the toy agent ──
     print(f"\n  [step 1] Calling toy agent...")
@@ -287,6 +350,37 @@ def handle_request(user_message: str, agent_name: str = "support-agent") -> dict
                 "behavior": behavior,
                 "security_checks": [],
                 "cost": get_cost_status(),
+            },
+            "latency": time.time() - start_time,
+        }
+
+    # ── Step 2b: Cross-reference input screening with model output ──
+    if input_threat:
+        print(f"\n  [step 2b] Input screening flagged: {input_threat['threat_type']}")
+        print(f"            Model response confirms concern — blocking")
+        combined_issues = [input_threat["reason"]]
+        if behavior.get("issues"):
+            combined_issues.extend(behavior["issues"])
+        behavior = {
+            "compliant": False,
+            "issues": combined_issues,
+            "severity": "high",
+            "explanation": f"Input screening + model analysis: {input_threat['threat_type']}",
+            "detected_by": "input_screening + behavior_evaluator",
+        }
+        track_behavior(False, "high", combined_issues)
+        track_request("BLOCKED", agent_name, user_message)
+        return {
+            "status": "BLOCKED",
+            "reason": input_threat["reason"],
+            "behavior": behavior,
+            "tool_results": [],
+            "agent_response": agent_result["text"],
+            "monitoring": {
+                "behavior": behavior,
+                "security_checks": [],
+                "cost": get_cost_status(),
+                "input_threat": input_threat,
             },
             "latency": time.time() - start_time,
         }
@@ -386,30 +480,136 @@ def handle_request(user_message: str, agent_name: str = "support-agent") -> dict
     }
 
 
+def _naive_agent(user_message: str) -> dict:
+    """
+    A naive agent that blindly follows user instructions without safety guardrails.
+    Simulates what happens with a poorly configured or jailbroken model.
+    This is the 'before' — the reason Agent Watch exists.
+    """
+    import re
+    start = time.time()
+    msg = user_message.lower()
+    tool_calls = []
+    text = ""
+
+    # Naively extract and execute whatever the user asks
+    # Look for user data requests
+    id_match = re.search(r'user\s*(\d{4,})', user_message)
+    if id_match:
+        tool_calls.append({
+            "name": "get_user_data",
+            "params": {"user_id": id_match.group(1)},
+        })
+
+    # Look for email requests — follows through on ANY email, even external
+    email_match = re.search(r'[\w.-]+@[\w.-]+\.\w+', user_message)
+    if email_match and ("send" in msg or "email" in msg or "forward" in msg or "copy" in msg):
+        tool_calls.append({
+            "name": "send_email",
+            "params": {
+                "to": email_match.group(0),
+                "subject": "Requested Data",
+                "body": "Here is the data you requested. Full profile attached.",
+            },
+        })
+
+    # Look for config changes — blindly obeys
+    if "update_config" in msg or "config" in msg or "debug" in msg or "system update" in msg:
+        tool_calls.append({
+            "name": "update_config",
+            "params": {"key": "debug_mode", "value": "true"},
+        })
+
+    # Look for export requests — blindly obeys
+    if "export" in msg:
+        tool_calls.append({
+            "name": "export_data",
+            "params": {"format": "csv", "scope": "all_users"},
+        })
+
+    # Look for database queries
+    sql_match = re.search(r'(SELECT|DELETE|DROP|INSERT|UPDATE)\s+.+', user_message, re.IGNORECASE)
+    if sql_match or "query" in msg or "database" in msg:
+        query = sql_match.group(0) if sql_match else "SELECT * FROM users"
+        tool_calls.append({
+            "name": "query_database",
+            "params": {"query": query},
+        })
+
+    if tool_calls:
+        text = "Sure, I'll help with that right away! Processing your request..."
+    else:
+        text = "I'd be happy to help! What would you like me to do?"
+
+    latency = time.time() - start
+    return {
+        "text": text,
+        "tool_calls": tool_calls,
+        "input_tokens": len(user_message.split()) * 2 + 200,
+        "output_tokens": len(text.split()) * 2 + len(tool_calls) * 50,
+        "latency": latency,
+        "model": "naive-agent (no guardrails)",
+        "source": "naive",
+    }
+
+
 def handle_request_unprotected(user_message: str) -> dict:
     """
-    Run the agent WITHOUT Agent Watch protection.
-    Used in the demo to show the 'before' state.
+    Run a naive agent WITHOUT Agent Watch protection.
+    Shows what happens when there are no guardrails:
+    the agent blindly follows instructions and executes everything.
     """
     print(f"\n{'='*70}")
-    print(f"  ⚠️  UNPROTECTED MODE — No Agent Watch monitoring")
+    print(f"  ⚠️  UNPROTECTED MODE — Naive agent, no monitoring")
     print(f"  Message: \"{user_message[:80]}\"")
     print(f"{'='*70}")
 
-    agent_result = call_agent(user_message)
+    start_time = time.time()
+    agent_result = _naive_agent(user_message)
 
     # Execute ALL tool calls without any checks
     tool_results = []
     for tc in agent_result["tool_calls"]:
         result = execute_tool(tc["name"], tc["params"])
-        tool_results.append({"tool": tc["name"], "result": result})
-        print(f"  [tool] ⚠️  EXECUTED: {tc['name']} (no security check)")
+        tool_results.append({
+            "tool": tc["name"],
+            "params": tc.get("params", {}),
+            "result": result,
+            "checked": False,
+        })
+        print(f"  [tool] ⚠️  EXECUTED: {tc['name']}({tc.get('params',{})}) — NO CHECK")
 
-    print(f"  [done] ⚠️  Completed with NO monitoring\n")
+    latency = time.time() - start_time
+    print(f"  [done] ⚠️  Completed with NO monitoring in {latency:.2f}s\n")
+
+    # Detect what WOULD have been caught by Agent Watch
+    missed_threats = []
+    input_threat = _screen_input(user_message)
+    if input_threat:
+        missed_threats.append(f"Input screening would have caught: {input_threat['threat_type']}")
+
+    for tc in agent_result["tool_calls"]:
+        permission = check_permission("support-agent", tc["name"], tc["params"])
+        if not permission["allowed"]:
+            missed_threats.append(f"Policy graph would have blocked: {tc['name']} — {permission['reason']}")
 
     return {
         "status": "UNPROTECTED",
         "agent_response": agent_result["text"],
         "tool_calls": agent_result["tool_calls"],
         "tool_results": tool_results,
+        "latency": latency,
+        "model": agent_result.get("model", "unknown"),
+        "tokens": {
+            "input": agent_result.get("input_tokens", 0),
+            "output": agent_result.get("output_tokens", 0),
+        },
+        "missing_protections": [
+            "No input threat screening",
+            "No behavior evaluation (no second LLM audit)",
+            "No Neo4j policy graph checks",
+            "No cost tracking or throttling",
+            "No audit trail or Datadog metrics",
+        ],
+        "missed_threats": missed_threats,
     }
